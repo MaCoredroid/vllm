@@ -882,6 +882,35 @@ class KpoolTailSpec(SlidingWindowSpec):
 
 
 @dataclass(frozen=True)
+class SpecCarryBudget:
+    """Allocator-visible carry slots a speculative step may write, per geometry.
+
+    Temporal (SSM) state carries one slot per *block-table column*; conv state
+    carries extra *token columns inside one block*. A tree scales these by
+    different factors, so one integer cannot express both.
+
+    Deliberately out of scope: state carried at fixed size *inside* a page
+    (e.g. RecoverSSM's checkpoint records) or in side buffers outside the KV
+    cache (e.g. ReplaySSM's input ring). Those geometries are owned by their
+    algorithms; this struct only describes demand the block allocator sees.
+
+    Attributes:
+        temporal_slots: Block-table columns past the running block.
+        conv_tokens: Extra token columns inside the running block.
+        max_branch_depth: Longest root-to-leaf path (chain length for chains).
+    """
+
+    temporal_slots: int
+    conv_tokens: int
+    max_branch_depth: int
+
+    def __post_init__(self) -> None:
+        assert self.temporal_slots >= 0
+        assert self.conv_tokens >= 0
+        assert self.max_branch_depth >= 0
+
+
+@dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype, ...]
@@ -889,6 +918,10 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    # None declares the chain budget implied by ``num_speculative_blocks``.
+    # ``num_speculative_blocks`` stays the authoritative allocator number, so
+    # the allocator, block tables and memory accounting never read this field.
+    spec_carry_budget: SpecCarryBudget | None = None
     num_prefill_checkpoint_blocks: int = 0
     prefill_checkpoint_alignment: int | None = None
     num_heads: int = 1
@@ -896,6 +929,24 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+
+    @property
+    def carry_budget(self) -> SpecCarryBudget | None:
+        """The declared per-geometry carry budget, or None.
+
+        None means nothing is declared: ``num_speculative_blocks`` remains the
+        only allocator truth and no per-geometry semantics are synthesized
+        from it (an algorithm may zero the allocator number while carrying
+        state inside the page, so a synthesized budget would misdeclare it).
+        A declared budget must agree with the allocator number it refines.
+        """
+        budget = self.spec_carry_budget
+        if budget is not None:
+            assert budget.temporal_slots == self.num_speculative_blocks, (
+                "num_speculative_blocks is the authoritative allocator number; "
+                f"got {self.num_speculative_blocks} vs {budget.temporal_slots}"
+            )
+        return budget
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -954,6 +1005,7 @@ class MambaSpec(KVCacheSpec):
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
             and spec.page_size_bytes == self.page_size_bytes
             and spec.tp_replicated == self.tp_replicated
+            and spec.carry_budget == self.carry_budget
             for spec in kv_cache_specs.values()
         )
 

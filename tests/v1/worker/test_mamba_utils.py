@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.mamba_utils import (
+    NO_PARENT_SLOT,
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
     _reinterpret_u64_as_i64,
@@ -32,6 +33,7 @@ from vllm.v1.worker.mamba_utils import (
     do_mamba_copy_block,
     get_mamba_groups,
     preprocess_mamba,
+    select_parent_slot,
     stage_postprocess_inputs_to_gpu,
 )
 
@@ -389,7 +391,11 @@ def _make_dual_layer_state(
     return conv_py[0], temporal_py[0], conv_gpu[0], temporal_gpu[0], fwd_py, fwd_gpu
 
 
-def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheConfig:
+def _make_kv_cache_config(
+    cfg: _TestConfig,
+    layer_names: list[str],
+    num_speculative_blocks: int = 0,
+) -> KVCacheConfig:
     """Create a KVCacheConfig with mamba groups."""
     mamba_spec = MambaSpec(
         block_size=cfg.block_size,
@@ -399,6 +405,7 @@ def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheCo
         ),
         dtypes=(cfg.dtype, cfg.dtype),
         mamba_cache_mode="all",
+        num_speculative_blocks=num_speculative_blocks,
     )
     group = KVCacheGroupSpec(
         layer_names=layer_names,
@@ -636,6 +643,168 @@ def test_mamba_groups_support_mixed_specs_in_uniform_group():
     )
     assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 0]
     assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 12]
+
+
+# -----------------------------------------------------------------------------
+# node_parent_slot: per-node parent indexing for branch-local scans
+# -----------------------------------------------------------------------------
+
+# One request, mid-sequence, with gamma=2 speculative blocks and 3 accepted
+# tokens, so the legacy select reads a block-table column two past the running
+# one and a tree-shaped parent can name a different one.
+_PARENT_GAMMA = 2
+_PARENT_NUM_ACCEPTED = 3
+_PARENT_BLOCK_IDS = [10, 11, 12, 13, 14]
+_PARENT_PREV_STATE_IDX = 1
+
+
+def _staged_copies(copy_bufs: MambaCopyBuffers) -> list[tuple[int, int, int]]:
+    n = copy_bufs.offset
+    return list(
+        zip(
+            copy_bufs.src_ptrs.np[:n].tolist(),
+            copy_bufs.dst_ptrs.np[:n].tolist(),
+            copy_bufs.sizes.np[:n].tolist(),
+        )
+    )
+
+
+class _ParentEnv:
+    """One spec-decoding request's scalar (non-fused) align pre-copy.
+
+    State tensors are allocated once and reused across runs so that staged
+    source addresses are comparable between parent tables.
+    """
+
+    def __init__(self) -> None:
+        self.cfg = _TestConfig(num_layers=1, num_reqs=1)
+        self.device = torch.device("cpu")
+        self.kv_cache_config = _make_kv_cache_config(
+            self.cfg, ["layer_0"], _PARENT_GAMMA
+        )
+        (
+            self.conv_state,
+            self.temporal_state,
+            _,
+            _,
+            self.forward_context,
+            _,
+        ) = _make_dual_layer_state(self.cfg, self.device)
+
+    def run(self, node_parent_slot: torch.Tensor | None) -> list[tuple[int, int, int]]:
+        copy_bufs = _make_copy_bufs(self.cfg, self.kv_cache_config, self.device)
+        # num_computed + num_scheduled spans 3 blocks, so with gamma=2 the
+        # running state column advances from _PARENT_PREV_STATE_IDX to 2.
+        # The staged copy plan is the observable here; the device memcpy that
+        # consumes it needs real GPU pointers.
+        with patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"):
+            preprocess_mamba(
+                _make_postprocess_scheduler_output(["req_a"], {"req_a": 3}),
+                self.kv_cache_config,
+                MagicMock(enable_prefix_caching=True),
+                {"req_a": _PARENT_PREV_STATE_IDX},
+                _make_input_batch(["req_a"], [_PARENT_NUM_ACCEPTED], [0]),
+                _make_requests(["req_a"], [32], [_PARENT_BLOCK_IDS]),
+                self.forward_context,
+                _COPY_FUNCS,
+                copy_bufs,
+                node_parent_slot=node_parent_slot,
+            )
+        return _staged_copies(copy_bufs)
+
+
+@pytest.mark.parametrize(
+    "parents",
+    [
+        None,
+        # NO_PARENT_SLOT: "select the initial state the legacy way".
+        [[NO_PARENT_SLOT, NO_PARENT_SLOT, NO_PARENT_SLOT]],
+        # A chain encodes itself as parent == num_accepted - 1.
+        [[_PARENT_NUM_ACCEPTED - 1, NO_PARENT_SLOT, NO_PARENT_SLOT]],
+    ],
+    ids=["absent", "sentinel", "chain-encoded"],
+)
+def test_chain_parents_stage_byte_identical_copies(parents):
+    """A chain is a tree of fan-out 1 whose parent is its predecessor, so every
+    way of spelling that must stage exactly the copies HEAD stages today."""
+    env = _ParentEnv()
+    tensor = None if parents is None else torch.tensor(parents, dtype=torch.int32)
+
+    assert env.run(tensor) == env.run(None)
+
+
+def test_tree_parent_moves_only_the_temporal_carry():
+    """Temporal carry selects a block-table column and so follows the parent
+    slot; conv carry slides inside one block and stays depth-indexed."""
+    env = _ParentEnv()
+    parents = torch.tensor([[0, NO_PARENT_SLOT, NO_PARENT_SLOT]], dtype=torch.int32)
+
+    conv_src, temporal_src = (src for src, _, _ in env.run(parents))
+    base_conv_src, base_temporal_src = (src for src, _, _ in env.run(None))
+
+    # Conv: unchanged window slide inside the previous running block.
+    assert conv_src == base_conv_src
+    assert conv_src == (
+        env.conv_state[_PARENT_BLOCK_IDS[_PARENT_PREV_STATE_IDX]][
+            _PARENT_NUM_ACCEPTED - 1 :
+        ].data_ptr()
+    )
+    # Temporal: parent slot 0 instead of the accepted depth (num_accepted - 1).
+    assert temporal_src != base_temporal_src
+    assert base_temporal_src == (
+        env.temporal_state[
+            _PARENT_BLOCK_IDS[_PARENT_PREV_STATE_IDX + _PARENT_NUM_ACCEPTED - 1]
+        ].data_ptr()
+    )
+    assert temporal_src == (
+        env.temporal_state[_PARENT_BLOCK_IDS[_PARENT_PREV_STATE_IDX]].data_ptr()
+    )
+
+
+@pytest.mark.parametrize(
+    ("parents", "num_accepted", "expected"),
+    [
+        (None, 3, 2),
+        ([[NO_PARENT_SLOT, 1]], 3, 2),
+        ([[0, NO_PARENT_SLOT]], 3, 0),
+        ([[2, NO_PARENT_SLOT]], 1, 2),
+    ],
+)
+def test_select_parent_slot(parents, num_accepted, expected):
+    tensor = None if parents is None else torch.tensor(parents, dtype=torch.int32)
+    assert select_parent_slot(tensor, 0, num_accepted) == expected
+
+
+def test_fused_precopy_rejects_parents_rather_than_ignoring_them():
+    """The fused align kernel reads a single token_bias, so it cannot honor a
+    parent slot yet; failing loudly beats silently reading the wrong state."""
+    cfg = _TestConfig(num_layers=1)
+    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
+    align_ctx = _make_gpu_ctx(cfg, kv_cache_config, torch.device("cpu"))
+
+    with pytest.raises(NotImplementedError):
+        preprocess_mamba(
+            _make_postprocess_scheduler_output([], {}),
+            kv_cache_config,
+            MagicMock(enable_prefix_caching=True),
+            {},
+            _make_input_batch([], [], []),
+            {},
+            {},
+            _COPY_FUNCS,
+            _make_copy_bufs(cfg, kv_cache_config, torch.device("cpu")),
+            align_ctx=align_ctx,
+            node_parent_slot=torch.zeros(1, 1, dtype=torch.int32),
+        )
+
+
+def test_gpu_context_declares_no_parent_table_by_default():
+    cfg = _TestConfig(num_layers=1)
+    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
+
+    ctx = _make_gpu_ctx(cfg, kv_cache_config, torch.device("cpu"))
+
+    assert ctx.node_parent_slot is None
 
 
 # -----------------------------------------------------------------------------

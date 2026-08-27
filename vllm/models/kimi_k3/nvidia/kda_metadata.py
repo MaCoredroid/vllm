@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.recoverssm_metadata import (
+    AcceptedPath,
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
@@ -279,8 +280,15 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     checkpoint: KDACheckpointMetadata | None = None
 
     def commit_recoverssm_state(
-        self, num_accepted_tokens: torch.Tensor
+        self,
+        num_accepted_tokens: torch.Tensor,
+        accepted_path: AcceptedPath | None = None,
     ) -> RecoverSSMPostprocessMetadata | None:
+        if accepted_path is not None and not accepted_path.is_linear:
+            raise NotImplementedError(
+                "KDA RecoverSSM commits a contiguous accepted window; "
+                "scattered accepted paths are not supported yet"
+            )
         commit = self.recoverssm_commit
         if commit is None:
             return None

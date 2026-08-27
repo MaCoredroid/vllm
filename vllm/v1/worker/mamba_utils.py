@@ -35,6 +35,12 @@ logger = init_logger(__name__)
 # microbenchmarks
 _TEMPORAL_TILES = 16
 
+# Sentinel in a ``node_parent_slot`` table meaning "select this request's
+# initial state the legacy way", i.e. by accepted-token depth. Distinct from
+# every valid slot-table index, and unrelated to the ``NULL_BLOCK_ID == 0``
+# sentinel of the block ids the table indexes into.
+NO_PARENT_SLOT = -1
+
 
 @triton.jit(do_not_specialize=["num_requests"])
 def get_aligned_state_indices_multi_group_kernel(
@@ -828,6 +834,13 @@ class MambaSpecDecodeGPUContext:
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
 
+    # Optional int32 [num_reqs, num_slots] parent table naming, per emitted
+    # node, which slot its scan starts from (``NO_PARENT_SLOT`` to defer to the
+    # accepted-token depth). A chain never needs one; there is no producer yet.
+    # A CUDA-graph-resident buffer must be padded with ``NO_PARENT_SLOT``,
+    # unlike the ``num_accepted_tokens`` buffer whose neutral pad value is 1.
+    node_parent_slot: torch.Tensor | None = None
+
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
@@ -1330,6 +1343,35 @@ class MambaBuffers:
         )
 
 
+def select_parent_slot(
+    node_parent_slot: torch.Tensor | None,
+    req_idx: int,
+    num_accepted_tokens: int,
+) -> int:
+    """Slot-table index of the state a request's next scan starts from.
+
+    Args:
+        node_parent_slot: int32 ``[num_reqs, num_slots]`` table, or None. Entry
+            ``[i, t]`` is the index **into request ``i``'s slot table** of node
+            ``t``'s parent state; ``NO_PARENT_SLOT`` defers to the legacy
+            depth-based select. Column 0 holds the branch root, which is all a
+            single-branch scan reads.
+        req_idx: Request index into ``node_parent_slot``.
+        num_accepted_tokens: The request's accepted-token count.
+
+    Returns:
+        The parent slot index, or ``num_accepted_tokens - 1`` when no parent is
+        declared. A chain encodes itself as
+        ``node_parent_slot[i, 0] = num_accepted_tokens[i] - 1``, so both
+        branches return the same value for every chain.
+    """
+    if node_parent_slot is not None:
+        parent = int(node_parent_slot[req_idx][0])
+        if parent != NO_PARENT_SLOT:
+            return parent
+    return num_accepted_tokens - 1
+
+
 def collect_mamba_copy_meta(
     copy_bufs: MambaCopyBuffers,
     kv_cache_config: KVCacheConfig,
@@ -1340,8 +1382,23 @@ def collect_mamba_copy_meta(
     accept_token_bias: int,
     req_state: CachedRequestState,
     forward_context: dict[str, Any],
+    temporal_src_bias: int | None = None,
 ) -> None:
-    if src_block_idx == dest_block_idx and accept_token_bias == 0:
+    """Stage the per-(layer, state) block copies for one request.
+
+    ``accept_token_bias`` drives both carry geometries by default. A tree
+    scales them differently (``SpecCarryBudget``): the temporal carry selects a
+    *block-table column* and so follows the accepted path's parent slot, while
+    the conv carry slides *inside* one block and stays depth-indexed. Passing
+    ``temporal_src_bias`` splits the two; None keeps them equal.
+    """
+    if temporal_src_bias is None:
+        temporal_src_bias = accept_token_bias
+    if (
+        src_block_idx == dest_block_idx
+        and accept_token_bias == 0
+        and temporal_src_bias == 0
+    ):
         return
 
     src_ptrs_np = copy_bufs.src_ptrs.np
@@ -1360,9 +1417,12 @@ def collect_mamba_copy_meta(
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
             for state, state_copy_func in zip(kv_caches, state_copy_funcs):
-                copy_spec = state_copy_func(
-                    state, block_ids, src_block_idx, accept_token_bias + 1
+                bias = (
+                    temporal_src_bias
+                    if state_copy_func is get_temporal_copy_spec
+                    else accept_token_bias
                 )
+                copy_spec = state_copy_func(state, block_ids, src_block_idx, bias + 1)
 
                 src_ptrs_np[offset] = copy_spec.start_addr
                 dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
@@ -1442,12 +1502,21 @@ def preprocess_mamba(
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
     copy_bufs: MambaCopyBuffers,
     align_ctx: MambaSpecDecodeGPUContext | None = None,
+    node_parent_slot: torch.Tensor | None = None,
 ):
     """
     Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
+
+    ``node_parent_slot`` optionally names the parent slot each request's carry
+    is read from (see ``select_parent_slot``); None reproduces the accepted-
+    token-depth select.
     """
     fused = _resolve_fused_precopy(align_ctx)
+    if fused is not None and node_parent_slot is not None:
+        raise NotImplementedError(
+            "node_parent_slot is not consumed by the fused align pre-copy yet"
+        )
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
@@ -1504,7 +1573,8 @@ def preprocess_mamba(
             fused.state_idx.np[i] = curr_state_idx
 
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
-            accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
+            num_accepted = int(input_batch.num_accepted_tokens_cpu[i])
+            accept_token_bias = num_accepted - 1
             if fused is not None:
                 assert accept_token_bias >= 0
                 fused.src_col.np[i] = prev_state_idx
@@ -1520,6 +1590,9 @@ def preprocess_mamba(
                     accept_token_bias,
                     req_state,
                     forward_context,
+                    temporal_src_bias=select_parent_slot(
+                        node_parent_slot, i, num_accepted
+                    ),
                 )
             input_batch.num_accepted_tokens_cpu[i] = 1
 

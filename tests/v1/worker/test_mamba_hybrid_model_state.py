@@ -10,6 +10,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
+    AcceptedPath,
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
@@ -103,7 +104,56 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
         num_accepted_tokens=num_accepted_tokens,
     )
 
-    metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
+    metadata.commit_recoverssm_state.assert_called_once_with(num_sampled, None)
+
+
+def test_recoverssm_linear_accepted_path_matches_the_chain_default() -> None:
+    """AcceptedPath.linear is the shape a chain always accepts, so it must
+    reach the committer flagged linear and let it keep its fast path."""
+    num_sampled = torch.tensor([3, 1], dtype=torch.int32)
+    path = AcceptedPath.linear(num_sampled, max_depth=4)
+
+    assert path.is_linear
+    assert path.node_ids.tolist() == [[0, 1, 2, -1], [0, -1, -1, -1]]
+    assert path.path_lens.tolist() == [3, 1]
+    assert _commit_with_path(num_sampled, path) == (num_sampled, path)
+
+
+def test_recoverssm_carries_node_identity_a_scattered_path_needs() -> None:
+    """A tree accepts a scattered node set that num_accepted_tokens alone
+    cannot name; the hook has to carry the node ids to the committer."""
+    num_sampled = torch.tensor([3], dtype=torch.int32)
+    scattered = AcceptedPath(
+        node_ids=torch.tensor([[0, 2, 5, -1]], dtype=torch.int32),
+        path_lens=torch.tensor([3], dtype=torch.int32),
+        is_linear=False,
+    )
+    linear = AcceptedPath.linear(num_sampled, max_depth=4)
+
+    # Same acceptance count, different accepted nodes.
+    assert scattered.path_lens.tolist() == linear.path_lens.tolist()
+    assert scattered.node_ids.tolist() != linear.node_ids.tolist()
+    assert _commit_with_path(num_sampled, scattered) == (num_sampled, scattered)
+
+
+def _commit_with_path(
+    num_sampled: torch.Tensor, accepted_path: AcceptedPath | None
+) -> tuple[torch.Tensor, AcceptedPath | None]:
+    """Drive one commit_step and return what reached the committer."""
+    state = RecoverSSMState()
+    metadata = Mock(spec=RecoverSSMMetadata)
+    metadata.commit_recoverssm_state.return_value = None
+    group = SimpleNamespace(layer_names=["layer"])
+
+    state.record_step({"layer": metadata}, [[group]], for_capture=False)
+    state.commit_step(
+        num_sampled,
+        torch.arange(num_sampled.numel(), dtype=torch.int32),
+        state_indices=None,
+        num_accepted_tokens=torch.ones(num_sampled.numel(), dtype=torch.int32),
+        accepted_path=accepted_path,
+    )
+    return metadata.commit_recoverssm_state.call_args.args
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
