@@ -6,7 +6,10 @@ from typing import Any
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backends.recoverssm_metadata import RecoverSSMMetadata
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    AcceptedPath,
+    RecoverSSMMetadata,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -42,14 +45,23 @@ class RecoverSSMState:
         *,
         state_indices: torch.Tensor | None,
         num_accepted_tokens: torch.Tensor,
+        accepted_path: AcceptedPath | None = None,
     ) -> None:
+        """Commit this step's RecoverSSM state.
+
+        ``accepted_path`` names which emitted nodes were accepted; None means
+        the contiguous window implied by ``num_sampled``, which is what a chain
+        always accepts.
+        """
         step = self._step
         self._step = None
         if isinstance(num_sampled, int) or step is None:
             return
 
         for metadata in step:
-            postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
+            postprocess_meta = metadata.commit_recoverssm_state(
+                num_sampled, accepted_path
+            )
             if postprocess_meta is None:
                 continue
             assert state_indices is not None

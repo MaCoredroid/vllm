@@ -335,7 +335,11 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
         accept_token_bias,
         req_state,
         forward_context,
+        temporal_src_bias=None,
     ):
+        # No parent table is supplied, so the temporal carry must resolve to
+        # the same accepted-token depth the conv carry uses.
+        assert temporal_src_bias == accept_token_bias
         scalar_copy_calls.append(
             (
                 req_state.req_id,
@@ -366,7 +370,7 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
         input_batch=scalar_case[1],
         requests=scalar_case[2],
         forward_context={},
-        mamba_state_copy_funcs=(),
+        mamba_state_copy_funcs={},
         copy_bufs=scalar_copy_bufs,
     )
 
@@ -384,7 +388,7 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
         input_batch=fused_case[1],
         requests=fused_case[2],
         forward_context={},
-        mamba_state_copy_funcs=(),
+        mamba_state_copy_funcs={},
         copy_bufs=fused_copy_bufs,
         align_ctx=ctx,
     )

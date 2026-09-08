@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    SpecCarryBudget,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -266,6 +267,11 @@ class TestKVCacheSpecRegistry:
             (SlidingWindowMLASpec, "sliding_window", 256),
             (ChunkedLocalAttentionSpec, "attention_chunk_size", 8),
             (MambaSpec, "num_speculative_blocks", 4),
+            (
+                MambaSpec,
+                "spec_carry_budget",
+                SpecCarryBudget(temporal_slots=2, conv_tokens=1, max_branch_depth=1),
+            ),
         ],
     )
     def test_specs_with_type_specific_uniform_fields(self, spec_cls, field, value):
@@ -421,3 +427,76 @@ class TestGetKVCacheSpecKind:
         } == {SlidingWindowSpec}
 
         assert get_kv_cache_spec_kind(group) == KVCacheSpecKind.UNKNOWN
+
+
+class TestMambaSpecCarryBudget:
+    """A declared carry budget separates the two carry geometries a tree
+    scales differently, without moving any allocation number."""
+
+    def test_default_declares_nothing(self):
+        # No declaration means no synthesized semantics: an algorithm may zero
+        # the allocator number while carrying state inside the page
+        # (RecoverSSM) or in side buffers (ReplaySSM), so a default budget
+        # would misdeclare it.
+        spec = make_spec(MambaSpec)
+
+        assert spec.spec_carry_budget is None
+        assert spec.carry_budget is None
+
+    def test_declaring_the_chain_budget_changes_no_allocation(self):
+        spec = make_spec(MambaSpec)
+        gamma = spec.num_speculative_blocks
+        explicit = replace(
+            spec,
+            spec_carry_budget=SpecCarryBudget(
+                temporal_slots=gamma, conv_tokens=gamma, max_branch_depth=gamma
+            ),
+        )
+
+        assert explicit.carry_budget == explicit.spec_carry_budget
+        assert explicit.max_memory_usage_bytes(
+            vllm_config
+        ) == spec.max_memory_usage_bytes(vllm_config)
+        assert explicit.max_num_blocks_per_req(
+            vllm_config, 1024
+        ) == spec.max_num_blocks_per_req(vllm_config, 1024)
+        # Identically-declared specs group; a declared spec does not silently
+        # group with an undeclared one (deliberate tightening).
+        assert are_uniform_specs(explicit, replace(explicit))
+        assert not are_uniform_specs(spec, explicit)
+
+    def test_the_new_field_preserves_equality_and_hash(self):
+        assert make_spec(MambaSpec) == make_spec(MambaSpec)
+        assert hash(make_spec(MambaSpec)) == hash(make_spec(MambaSpec))
+
+    def test_a_tree_budget_does_not_move_the_allocation(self):
+        """num_speculative_blocks stays the authoritative allocator number, so
+        a tree that widens conv/depth accounting reserves the same memory."""
+        spec = make_spec(MambaSpec)
+        tree = replace(
+            spec,
+            spec_carry_budget=SpecCarryBudget(
+                temporal_slots=spec.num_speculative_blocks,
+                conv_tokens=1,
+                max_branch_depth=1,
+            ),
+        )
+
+        assert tree.carry_budget.max_branch_depth == 1
+        assert tree.max_memory_usage_bytes(vllm_config) == spec.max_memory_usage_bytes(
+            vllm_config
+        )
+
+    def test_a_budget_contradicting_the_allocator_number_fails_loudly(self):
+        spec = make_spec(MambaSpec)
+        bad = replace(
+            spec,
+            spec_carry_budget=SpecCarryBudget(
+                temporal_slots=spec.num_speculative_blocks + 1,
+                conv_tokens=1,
+                max_branch_depth=1,
+            ),
+        )
+
+        with pytest.raises(AssertionError):
+            _ = bad.carry_budget
